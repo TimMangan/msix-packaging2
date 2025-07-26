@@ -147,10 +147,10 @@ Import-Module Hyper-V
 ####    This section provides overall control of the batch run feautures that you want to set
 ####    The default value commented out at the end of a line provides for a complete run.
 
-$CleanupOutputFolderAtStart = $false    #$true
+$CleanupOutputFolderAtStart = $true    #$true
 ## Boolean, when set to $true the output folder is cleared before stating a run.
 
-$PackageAllPackages         = $false     #$true
+$PackageAllPackages         = $true     #$true
 ## Boolean, when set to $true, a run will package the apps using the MMPT, subhect to override by $skpFrrst,  
 ## PackageMissingPackagesm and $doOnlyThisPackageName settings.
 
@@ -160,13 +160,13 @@ $PackageMissingPackages     = $false    #$true
 $skipFirst                  = 0         
 ## Number, Normally set to zero; set to a number to skip the first X apps in the array, useful if you add a few to the end of the list and just want to package it or if you need to stop and restart the script.
 
-$doOnlyThisPackageName      =  'XMing' ## 'TMurgent-TestAppPath1In1Out' ##         
+$doOnlyThisPackageName      =  '' ## '7-Zip' ##         
 ## String, normally set to ''; Set to the PackageName of a single app Name to run just that app, ignoring all App Array enabled/disabled settings.
 
 $retryBad                   = $false    
 ## Boolean, when set to $true, run a secondary MMPT pass for all enabled packages still missing a file in the output after primary pass.
 
-$SignPackages               = $false     #$true
+$SignPackages               = $true     #$true
 ## Boolean, when set to $true, run a Signing pass on all packages produced by the MMPT.  If all packages will pass through TMEditX
 ## this might not be needed.
 
@@ -176,7 +176,7 @@ $AutoFixPackages            = $true     #$true
 # After packaging conversions to MSIX App Attach Formats
 $AutoConvertPackagesVHD     = $false
 $AutoConvertPackagesVHDX    = $false
-$AutoConvertPackagesCIM     = $false
+$AutoConvertPackagesCIM     = $true
 
 ##### FEATURE CONTROL
 ########################################
@@ -205,9 +205,9 @@ $InstallerArgStart = "-ExecutionPolicy Bypass -File \\nuc2\installers\Automation
 ## These are used when running command remotely on the worker VM using remote powershell.
 ## Depending on your environment, the executionPolicy bypass may or may not be needed.
 
-$DefaultFixes = "/ApplyAllFixes /UseDebugPsf "
+$DefaultFixes = "/ApplyAllFixes "
 ## String, Used in the TMEditX command line arguments for most applications in the list.
-## Another possible example is: $DefaultFixes = "/ApplyAllFixes /AutoFixVcRuntimes "
+## Another possible example is: $DefaultFixes = "/ApplyAllFixes /UseDebugPsf /AutoFixVcRuntimes "
 
 
 $SaveAsFolder = "\\nuc7\Packages\TMEditX.6.0.43.0"
