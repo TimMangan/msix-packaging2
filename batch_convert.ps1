@@ -5,6 +5,8 @@ function CreateMPTTemplate($conversionParam, $refId,  $virtualMachine, $workingD
     $conversionMachine = "<mptv2:RemoteMachine ComputerName=""$($virtualMachine.Name)"" Username=""$($virtualMachine.Credential.UserName)"" />"
 
     $saveFolder = [System.IO.Path]::Combine($workingDirectory, "MSIX")
+
+    # The template of the template
     $xmlContent = @"
 <MsixPackagingToolTemplate
     xmlns="http://schemas.microsoft.com/appx/msixpackagingtool/template/2018"
@@ -21,6 +23,7 @@ $conversionMachine
 </PackageInformation>
 </MsixPackagingToolTemplate>
 "@
+    
     Set-Content -Value $xmlContent -Path $templateFilePath
     $templateFilePath
 }
@@ -28,8 +31,8 @@ $conversionMachine
 function RunRemotePreInstaller($virtualMachineName, $Installer)
 {
     # INPUTS:
-    #    $virtualMachineName:  Name of the Windows machine to remote to
-    #    $Installer:  Full path to a powershell ps1 file.
+    #    virtualMachineName:  Name of the Windows machine to remote to
+    #    Installer:  Full path to a powershell ps1 file.
     # PURPOSE: The installer file, along with all files in the same folder, will be copied to the named machine
     #          into a temporary folder and the ps1 file will be run on that machine from that temp location.
     Write-Output "---------------- Starting PreInstaller $($Installer) Remotely..." 
@@ -89,17 +92,16 @@ $FunctionRunRemotePreInstaller = @"
 
 Function RunRemotePreInstaller
 {
-$(Get-Command RunRemotePreInstaller | Select -expand Definition)
+    $(Get-Command RunRemotePreInstaller | Select -expand Definition)
 }
 
 "@
 
-function RunConversionJobs($conversionsParameters, $virtualMachines, $workingDirectory, $retryBad, $doNotCleanupAtStart, $skipFirst)
+function SetupOutputFolders($workingDirectory, $CleanupOutputFolderAtStart)
 {
-    Write-Host 'RunConversionJobs'
-    Write-Host "Dont Cleanup = $($doNotCleanupAtStart)"
+    Write-Host "Cleanup = $($CleanupOutputFolderAtStart)"
     #Cleanup previous run
-    if ($doNotCleanupAtStart -eq $false)
+    if ($CleanupOutputFolderAtStart -eq $true)
     {
         Write-Host 'Cleanups:'
         get-job | Stop-Job |Remove-Job
@@ -137,20 +139,31 @@ function RunConversionJobs($conversionsParameters, $virtualMachines, $workingDir
     {
         Write-Host 'Cleanups skipped.'
     }
+}
+
+function RunConversionJobs($AppConversionParameters, $virtualMachines, $workingDirectory, $retryBad, $CleanupOutputFolderAtStart, $skipFirst)
+{
+    Write-Host 'RunConversionJobs'
+
+    SetupOutputFolders $workingDirectory $CleanupOutputFolderAtStart
+
 
     $logfolder  = ([System.IO.Path]::Combine($workingDirectory, "LOGS"))
 
     # Ensure that the dynamic memory parameters are reset
-    foreach ($conv in $conversionsParameters)
+    foreach ($conv in $AppConversionParameters )
     {
-        JobSetStartedValue   $conv $false
-        JobSetCompletedValue $conv $false
+        if ($conv.Completed -ne $true)
+        {
+            JobSetStartedValue   $conv $false
+            JobSetCompletedValue $conv $false
+        }
     }
   
 
-    # create list of the indices of $conversionsParameters that haven't started running yet
+    # create list of the indices of $AppConversionParameters that haven't started running yet
     $remainingConversionIndexes = @()
-    $conversionsParameters | Foreach-Object { $i = $skipFirst } { $remainingConversionIndexes += ($i++) }
+    $AppConversionParameters | Foreach-Object { $i = $skipFirst } { $remainingConversionIndexes += ($i++) }
 
     $failedConversionIndexes = New-Object -TypeName "System.Collections.ArrayList"
     foreach ($fci in $failedConversionIndexes)
@@ -195,8 +208,8 @@ function RunConversionJobs($conversionsParameters, $virtualMachines, $workingDir
         {
             # select a job to run 
             Write-Host "Determining next job to run..."
-            $conversionParam = $conversionsParameters[$remainingConversionIndexes[0]]
-            if ( $conversionParam.Enabled)
+            $conversionParam = $AppConversionParameters[$remainingConversionIndexes[0]]
+            if ( $conversionParam.Enabled -and -not $conversionParam.Completed)
             {
                 # select a VM to run it on. Retry a few times due to race between semaphore signaling and process completion status
                 $vm = $nul
@@ -228,118 +241,143 @@ function RunConversionJobs($conversionsParameters, $virtualMachines, $workingDir
                 $password = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
 
                 $useLogFile = "$($logfolder)\$($conversionParam.PackageName)_$(Get-Date -format FileDateTime).txt"
-                Write-Host "Start Job  $($vm.npVmGetObj.ComputerName)  $($conversionParam.PackageName) " 
-                Write-Output "Start Job  $($vm.npVmGetObj.ComputerName)  $($conversionParam.PackageName) " > $useLogFile
+                Write-Host "Start Job (host)  $($vm.npVmGetObj.ComputerName)  $($conversionParam.PackageName) " > $useLogFile
+                Write-Output "Start Job (output)  $($vm.npVmGetObj.ComputerName)  $($conversionParam.PackageName) " > $useLogFile
                 $jobObject = start-job -ScriptBlock {  
                     param($refId, $vMachine,  $machinePassword, $templateFilePath, $initialSnapshotName,$logFile, $funcs)
                     
-                    Write-Output "Starting with params:  $($refId), $($vMachine.npVmGetObj.ComputerName)/$($vMachine.npVmGetObj.Name), $($vmsCount), $($machinePassword), $($templateFilePath), $($initialSnapshotName), $($logFile)" >> $logFile
+                    Write-Host   "Starting Job $($refId) on VM $($vMachine)"
+                    Write-Output "Starting Job $($refId) on VM $($vMachine)"
 
-                    try
+                    $snap = Get-VMSnapshot -ComputerName $vMachine.npVmCfgObj.Host -VMName $vMachine.npVmCfgObj.Name -Name $initialSnapshotName
+                    if ($snap -eq $nul)
                     {
-                        Invoke-Expression $funcs
-                        Write-Output "debug: be4 get snapshot" >> $logFile
-                        $snap = Get-VMSnapshot -Name $initialSnapshotName -VMName $vMachine.npVmCfgObj.Name -ComputerName $vMachine.npVmCfgObj.Host -ErrorAction Continue
-                        Write-Output "debug: after get snapshot" >> $logFile
-                        if ( $snap)
+                        Write-Error "Host $($vMachine.npVmCfgObj.Host) VM $($vMachine.npVmCfgObj.Name) SnapShot $($initialSnapshotName) not found."
+                    }
+                    else
+                    {
+                        Write-Host   "Starting with params:  $($refId), $($vMachine.npVmGetObj.ComputerName)/$($vMachine.npVmGetObj.Name), $($vmsCount), $($machinePassword), $($templateFilePath), $($initialSnapshotName), $($logFile)"
+                        Write-Output "Starting with params:  $($refId), $($vMachine.npVmGetObj.ComputerName)/$($vMachine.npVmGetObj.Name), $($vmsCount), $($machinePassword), $($templateFilePath), $($initialSnapshotName), $($logFile)" >> $logFile
+
+                        try
                         {
-                            Write-Output "Reverting VM snapshot for  $($vMachine.npVmCfgObj.Host) / $($vMachine.npVmCfgObj.Name): $($initialSnapshotName)" >> $logFile
-                            Restore-VMSnapshot -ComputerName $vMachine.npVmCfgObj.Host -VMName $vMachine.npVmCfgObj.Name -Name $initialSnapshotName -Confirm:$false
-                            Write-Output "debug: after revert" >> $logFile
-                            ####we probably don't need to replace the vm object, but once had an issue so let's be sure...
-                            Start-Sleep 2
-                            $vMachine.npVmGetObj = (get-vm -ComputerName $vMachine.npVmCfgObj.Host -Name $vMachine.npVmCfgObj.Name)
-                            Set-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name -Notes "Preparing $($vMachine.npAppName)"
-                            
-                            if ( $vMachine.npVmGetObj.state -eq 'Off' -or $vMachine.npVmGetObj.state -eq 'Saved' )
+                            Invoke-Expression $funcs
+                            Write-Host   "debug: be4 get snapshot"
+                            Write-Output "debug: be4 get snapshot" >> $logFile
+                            $snap = Get-VMSnapshot -Name $initialSnapshotName -VMName $vMachine.npVmCfgObj.Name -ComputerName $vMachine.npVmCfgObj.Host -ErrorAction Continue
+                            Write-Host   "debug: after get snapshot"
+                            Write-Output "debug: after get snapshot" >> $logFile
+                            if ( $snap)
                             {
-                                Write-Output "Starting VM" >> $logFile
-                                Start-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name 
-                                #Write-Output "after Starting VM" >> $logFile
-                                $limit = 60
-                                while ($vMachine.npVmGetObj.state -ne 'Running')
+                                Write-Host   "Reverting VM snapshot for  $($vMachine.npVmCfgObj.Host) / $($vMachine.npVmCfgObj.Name): $($initialSnapshotName)"
+                                Write-Output "Reverting VM snapshot for  $($vMachine.npVmCfgObj.Host) / $($vMachine.npVmCfgObj.Name): $($initialSnapshotName)" >> $logFile
+                                Restore-VMSnapshot -ComputerName $vMachine.npVmCfgObj.Host -VMName $vMachine.npVmCfgObj.Name -Name $initialSnapshotName -Confirm:$false
+                                Write-Output "debug: after revert"
+                                Write-Host   "debug: after revert" >> $logFile
+                                ####we probably don't need to replace the vm object, but once had an issue so let's be sure...
+                                Start-Sleep 2
+                                $vMachine.npVmGetObj = (get-vm -ComputerName $vMachine.npVmCfgObj.Host -Name $vMachine.npVmCfgObj.Name)
+                                Set-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name -Notes "Preparing $($vMachine.npAppName)"
+                            
+                                if ( $vMachine.npVmGetObj.state -eq 'Off' -or $vMachine.npVmGetObj.state -eq 'Saved' )
                                 {
-                                    Start-Sleep 5
-                                    $limit = $limit - 1
-                                    if ($limit -eq 0)
+                                    Write-Host "Starting VM"\
+                                    Write-Output "Starting VM" >> $logFile
+                                    Start-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name 
+                                    #Write-Output "after Starting VM" >> $logFile
+                                    $limit = 60
+                                    while ($vMachine.npVmGetObj.state -ne 'Running')
                                     {
-                                        Write-Output "TIMEOUT while starting restored checkpoint' state=$($vMachine.npVmGetObj.state)." >> $logFile
-                                        $vMachine.npErrorCount = $vMachine.npErrorCount + 1
-                                        if ($vMachine.npVmGetObj.state -ne 'Off')
+                                        Start-Sleep 5
+                                        $limit = $limit - 1
+                                        if ($limit -eq 0)
                                         {
-                                            Write-Host "Debug: Stop VM $( $vMachine.npVmGetObj.Name)" >> $logFile
-                                            Stop-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name -TurnOff -Force -ErrorAction SilentlyContinue
+                                            Write-Host   "TIMEOUT while starting restored checkpoint' state=$($vMachine.npVmGetObj.state)."\
+                                            Write-Output "TIMEOUT while starting restored checkpoint' state=$($vMachine.npVmGetObj.state)." >> $logFile
+                                            $vMachine.npErrorCount = $vMachine.npErrorCount + 1
+                                            if ($vMachine.npVmGetObj.state -ne 'Off')
+                                            {
+                                                Write-Host "Debug: Stop VM $( $vMachine.npVmGetObj.Name)" >> $logFile
+                                                Stop-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name -TurnOff -Force -ErrorAction SilentlyContinue
+                                            }
+                                            break;
                                         }
-                                        break;
-                                    }
-                               }
+                                   }
+                                }
+                                else
+                                {
+                                    Write-Host   "Debug: state is $($vMachine.npVmGetObj.state)" 
+                                    Write-Output "Debug: state is $($vMachine.npVmGetObj.state)" >> $logFile
+                                }
                             }
                             else
                             {
-                                Write-Output "Debug: state is $($vMachine.npVmGetObj.state)" >> $logFile
+                                Write-Host   "Get-VMSnapshot error"\
+                                Write-Output "Get-VMSnapshot error" >> $logFile
                             }
-                        }
-                        else
-                        {
-                            Write-Output "Get-VMSnapshot error" >> $logFile
-                        }
-
-                        $waiting = $true
-                        $waitcount = 0
-                        ## Let VM Settle a little.  At times the VMs get a little busy thanks to MS and more time seems to work better.
-                        while ($waiting)
-                        {
-                            if ( $vMachine.npVmGetObj.state -eq 'Running' -and $vMachine.npVmGetObj.upTime.TotalSeconds -gt 120  )
+                            
+                            $waiting = $true
+                            $waitcount = 0
+                            ## Let VM Settle a little.  At times the VMs get a little busy thanks to MS and more time seems to work better.
+                            while ($waiting)
                             {
-                                $waiting = $false
-
-                                if ($vMachine.npPreInstall -ne $nul)
+                                if ( $vMachine.npVmGetObj.state -eq 'Running' -and $vMachine.npVmGetObj.upTime.TotalSeconds -gt 120  )
                                 {
-                                    Write-output "Before RunRemotePreInstaller"
-                                    RunRemotePreInstaller $vMachine.npVmGetObj.Name $vMachine.npPreInstall >> $logFile
-                                    Write-output "After RunRemotePreInstaller"
+                                    $waiting = $false
+
+                                    if ($vMachine.npPreInstall -ne $nul)
+                                    {
+                                        Write-host "Before RunRemotePreInstaller"
+                                        Write-output "Before RunRemotePreInstaller"
+                                        RunRemotePreInstaller $vMachine.npVmGetObj.Name $vMachine.npPreInstall >> $logFile
+                                        Write-host "After RunRemotePreInstaller"
+                                        Write-output "After RunRemotePreInstaller"
+}
+
+                                    
+                                    Set-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name -Notes "Packaging $($vMachine.npAppName)"
+                                    Write-Output "" >> $logFile
+                                    Write-Host   "==========================Starting package..." 
+                                    Write-Output "==========================Starting package..." >> $logFile
+                                    MsixPackagingTool.exe create-package --template $templateFilePath --machinePassword $machinePassword -v >> $logFile
+                                    Write-Host   "==========================Packaging tool done."
+                                    Write-Output "==========================Packaging tool done." >> $logFile
+                                    Write-Output "" >> $logFile
                                 }
-
-
-                                Set-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name -Notes "Packaging $($vMachine.npAppName)"
-                                Write-Output "" >> $logFile
-                                Write-Output "==========================Starting package..." >> $logFile
-                                MsixPackagingTool.exe create-package --template $templateFilePath --machinePassword $machinePassword -v >> $logFile
-                                Write-Output "==========================Packaging tool done." >> $logFile
-                                Write-Output "" >> $logFile
-                            }
-                            $waitcount += 1
-                            if ($waitcount -gt 360)
-                            {
-                                $waiting = $false
-                                Write-Output "Timeout waiting for OS to start" >> $logFile
-                                $vMachine.npErrorCount = $vMachine.npErrorCount + 1
-                                if ($vMachine.npVmGetObj.state -ne 'Off')
+                                $waitcount += 1
+                                if ($waitcount -gt 360)
                                 {
-                                    Write-Host "Debug: Stop VM $( $vMachine.npVmGetObj.Name)" >> $logFile
-                                    Stop-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name -TurnOff -Force -ErrorAction SilentlyContinue
+                                    $waiting = $false
+                                    Write-Host   "Timeout waiting for OS to start"
+                                    Write-Output "Timeout waiting for OS to start" >> $logFile
+                                    $vMachine.npErrorCount = $vMachine.npErrorCount + 1
+                                    if ($vMachine.npVmGetObj.state -ne 'Off')
+                                    {
+                                        Write-Host "Debug: Stop VM $( $vMachine.npVmGetObj.Name)" >> $logFile
+                                        Stop-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name -TurnOff -Force -ErrorAction SilentlyContinue
+                                    }
                                 }
+                                start-sleep 1
                             }
-                            start-sleep 1
+                            Write-Output "Debug: job ready for finalizing." >> $logFile
                         }
-                        Write-Output "Debug: job ready for finalizing." >> $logFile
-                    }
-                    catch
-                    {
-                        Write-Output "***EXECPTION***"
-                        Write-Output "***EXECPTION***" >> $logFile
-                        Write-Output $_
-                        Write-Output $_ >> $logfile
-                    }
-                    finally
-                    {
-                        Write-Output "Finalizing." >> $logFile
-                        Stop-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name -TurnOff -Force -ErrorAction SilentlyContinue
+                        catch
+                        {
+                            Write-Host   "***EXECPTION***"
+                            Write-Output "***EXECPTION***"
+                            Write-Output "***EXECPTION***" >> $logFile
+                            Write-Output $_
+                            Write-Output $_ >> $logfile
+                        }
+                        finally
+                        {
+                            Write-Output "Finalizing." >> $logFile
+                            Stop-VM -ComputerName $vMachine.npVmGetObj.ComputerName -Name $vMachine.npVmGetObj.Name -TurnOff -Force -ErrorAction SilentlyContinue
 
-                        #Read-Host -Prompt 'Press any key to exit this window '
-                        Write-Output "Complete." >> $logFile
+                            #Read-Host -Prompt 'Press any key to exit this window '
+                            Write-Output "Complete." >> $logFile
+                        }
                     }
-
                 }  -ArgumentList $refId,  $vm,  $password, $templateFilePath, $vm.npVmCfgObj.initialSnapshotName, $useLogFile, "$($FunctionRunRemotePreInstaller)"
                 $vm.npJobObj = $jobObject
                 write-host "Ref$($refId): job is named $($jobObject.Name)"
@@ -348,7 +386,14 @@ function RunConversionJobs($conversionsParameters, $virtualMachines, $workingDir
             else {
                 $refId = $remainingConversionIndexes[0]
                 $remainingConversionIndexes = $remainingConversionIndexes | where { $_ -ne $remainingConversionIndexes[0] }
-                Write-Host "Ref $($refId): $($conversionParam.PackageName) skipped by request." -ForegroundColor Yellow
+                if ($conversionParam.Enabled)
+                {
+                    Write-Host "Ref $($refId): $($conversionParam.PackageName) skipped by request (completed)." -ForegroundColor gray
+                }
+                else
+                {
+                    Write-Host "Ref $($refId): $($conversionParam.PackageName) skipped by request (disabled)." -ForegroundColor darkgray
+                }
                 $semaphore.Release()
             }
         }
@@ -362,7 +407,7 @@ function RunConversionJobs($conversionsParameters, $virtualMachines, $workingDir
         $tempFiledConversionIndexes = WaitForFreeVM $virtMachinesArray $workingDirectory
         foreach ($tempFail in $tempFiledConversionIndexes)
         {
-            if ($tempFail -gt 0 -and $conversionsParameters[$tempFail].Enabled -eq $true -and $conversionsParameters[$tempFail].Completed -eq $false)
+            if ($tempFail -gt 0 -and $AppConversionParameters[$tempFail].Enabled -eq $true -and $AppConversionParameters[$tempFail].Completed -eq $false)
             {
                 Write-host "Fail Ref $($tempFail)" -Foreground yellow
                 $failedConversionIndexes.Add($tempFail) > $xxx
@@ -382,9 +427,9 @@ function RunConversionJobs($conversionsParameters, $virtualMachines, $workingDir
         $tempFiledConversionIndexes = WaitForFreeVM $virtMachinesArray $workingDirectory
         foreach ($tempFail in $tempFiledConversionIndexes)
         {
-            if ($tempFail -gt 0 -and $conversionsParameters[$tempFail].Enabled -eq $true -and $conversionsParameters[$tempFail].Completed -eq $false)
+            if ($tempFail -gt 0 -and $AppConversionParameters[$tempFail].Enabled -eq $true -and $AppConversionParameters[$tempFail].Completed -eq $false)
             {
-                Write-host "Fail Ref $($tempFail)" -Foreground yellow
+                Write-host "Fail Ref is $($tempFail)" -Foreground yellow
                 $failedConversionIndexes.Add($tempFail) > $xxx
             }
         }
@@ -422,7 +467,7 @@ function RunConversionJobs($conversionsParameters, $virtualMachines, $workingDir
         Write-host "There are $($failedConversionIndexes.Count) packages for redo" -ForegroundColor Cyan
         foreach ($failedConversionIndex in $failedConversionIndexes)
         {
-            $failedConversionParameter = $conversionsParameters[$failedConversionIndex]
+            $failedConversionParameter = $AppConversionParameters[$failedConversionIndex]
             if ($failedConversionParameter.Completed -eq $false)
             {
                 Write-Host "Redo[$($failedConversionIndex)] for $($failedConversionParameter.PackageName) on $($bestvmachine.npVmCfgObj.Name)  "  -ForegroundColor Cyan
@@ -442,7 +487,7 @@ function RunConversionJobs($conversionsParameters, $virtualMachines, $workingDir
                 $failedConversionParameter.Started = $true
                 $failedConversionParameter.Completed = $false
 
-                $redoid = $conversionsParameters.Count + $failedConversionIndex + 1
+                $redoid = $AppConversionParameters.Count + $failedConversionIndex + 1
                 $templateFilePath = CreateMPTTemplate $failedConversionParameter $redoid $bestvmachine.npVmCfgObj $workingDirectory 
                 $BSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($bestvmachine.npVmCfgObj.Credential.Password)
                 $password = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($BSTR)
@@ -535,6 +580,7 @@ function WaitForFreeVM($virtMachinesArray, $workingDirectory)
                         else
                         {
                             Write-Host "Completion without package of  $($vm.npAppName) on $($vm.npVmGetObj.Name)." -ForegroundColor Red
+                            $vm.npAppConfiguration.Completed = $false
                             Checkpoint-VM -ComputerName $vm.npVmGetObj.ComputerName -Name $vm.npVmGetObj.Name -SnapshotName "$($vm.npAppName)_$(get-date)"
                             $thisPassFailedConversionIndexes.Add(($vm.npRefId)) > $xxx
                             $vm.npErrorCount = $vm.npErrorCount + 1
@@ -587,6 +633,7 @@ function CountEnabledInuseVMs($virtMachinesArray)
         if ($vm.npDisabled -eq $false -and $vm.npInuse -eq $true)
         {
             $Count = $Count + 1
+            Write-Host "VM $($vm.npVmCfgObj.Name) is still in use."
         }
     }
     return $Count
@@ -717,11 +764,11 @@ function JobSetCompletedValue($conversionParam,$value)
 }
 
 
-function FindUndoneJobs($conversionsParameters,$workingDirectory)
+function FindUndoneJobs($AppConversionParameters,$workingDirectory)
 {
     # NO longer used
     $undoneConversionArray = @() 
-    foreach ($conversionParam in $conversionParameters)
+    foreach ($conversionParam in $AppConversionParameters)
     {
         if ( $conversionParam.Enabled)
         {
@@ -734,19 +781,29 @@ function FindUndoneJobs($conversionsParameters,$workingDirectory)
     return $undoneConversionArray
 }
 
-function SignPackages($msixFolder, $signtoolPath, $certfile, $certpassword, $timestamper)
+function SignPackages($msixFolder, $signtoolPath, $certfile, $certpassword, $timestamper, $doOnlyThisPackageName)
 {
 
     Get-ChildItem $msixFolder | foreach-object {
         $msixPath = $_.FullName
-        Write-Host "Running: $signtoolPath sign /f $certfile /p "*redacted*" /fd SHA256 /t $timestamper $msixPath"
-        & $signtoolPath sign /f $certfile  /p $certpassword /fd SHA256 /t $timestamper $msixPath
+        if ($doOnlyThisPackageName -eq '')
+        {
+            Write-Host "Running: $signtoolPath sign /f $certfile /p "*redacted*" /fd SHA256 /t $timestamper $msixPath"
+            & $signtoolPath sign /f $certfile  /p $certpassword /fd SHA256 /t $timestamper $msixPath
+        }
+        elseif ($msixPath -like "*$($doOnlyThisPackageName)*")
+        {
+            Write-Host "Running: $signtoolPath sign /f $certfile /p "*redacted*" /fd SHA256 /t $timestamper $msixPath"
+            & $signtoolPath sign /f $certfile  /p $certpassword /fd SHA256 /t $timestamper $msixPath
+        }
     }
 }
 
-function AutoFixPackages($conversionsParameters, $inputfolder, $outputFolder)
+function AutoFixPackages($AppConversionParameters, $inputfolder, $outputFolder)
 {
     $Toolpath = 'TMEditX.exe'
+    $Processed = 0
+    $Attempted = 0
 
     if (-not (Test-Path -Path $outputFolder))
     {
@@ -754,26 +811,155 @@ function AutoFixPackages($conversionsParameters, $inputfolder, $outputFolder)
         New-Item -Force -Type Directory ($outputFolder)
     }
 
-    foreach ($conversionParam in $conversionsParameters)
+    foreach ($conversionParam in $AppConversionParameters)
     {
         $msixPath = [System.IO.Path]::Combine($inputfolder, $conversionParam.PackageName)
-        if ( $conversionParam.Enabled -and $conversionParam.Fixups -ne "")
+        $msixOutPath = [System.IO.Path]::Combine($outputFolder, $conversionParam.PackageName)
+        if ( $conversionParam.Enabled )
         {
-            $found = $false
-            Get-ChildItem $inputfolder | foreach-object {
-                if ($_.FullName.StartsWith($msixPath))
-                {
-                    Write-Host "Running: $($Toolpath) $($conversionParam.Fixups) $($_.FullName)" -ForegroundColor Cyan
-                    //& $Toolpath /ApplyAllFixes /AutoSaveAsMsix $_.FullName
-                    & $Toolpath $conversionParam.Fixups $_.FullName
-                    $found = $true
-                    Start-Sleep 5
+            if (  $conversionParam.Fixups -ne "")
+            {
+                $Attempted += 1
+                $found = $false
+                $foundOutput = $false
+                Get-ChildItem $inputfolder | foreach-object {
+                    if ($_.FullName.StartsWith($msixPath))
+                    {
+                        if ($_.Extension.ToLower().EndsWith("msix") -or $_.Extension.ToLower().EndsWith("appx"))
+                        {
+                            $defangedConversionParamFixups = $conversionParam.Fixups
+                            if ( $conversionParam.Fixups.StartsWith('"'))
+                            {
+                                $defangedConversionParamFixups = $conversionParam.Fixups.Trim('"').TrimEnd('"')
+                            }
+                            ##Write-Host "Running: $($Toolpath) $($defangedConversionParamFixups) $($_.FullName) $($msixOutPath)" -ForegroundColor Cyan
+                            ##& $Toolpath $defangedConversionParamFixups /AutoSaveAsMsix $msixOutPath
+                            Write-Host "Running: $($Toolpath) $($_.FullName) $($defangedConversionParamFixups)" -ForegroundColor Cyan
+                            ##& $Toolpath $defangedConversionParamFixups $_.FullName
+                            $arglist = "$($_.FullName) $($defangedConversionParamFixups)" 
+                            Start-Process -Wait -FilePath $Toolpath -ArgumentList $arglist
+                            $found = $true
+                            $Processed += 1
+                            Start-Sleep 5
+                        }
+                    }
+                }
+
+                Get-ChildItem $outputfolder | foreach-object {
+                    if ($_.FullName.StartsWith($msixOutPath))
+                    {
+                        $foundOutput = $true
+                    }
                 }
             }
             if (!$found)
             {
                 Write-host "$($msixPath)_* not found" -ForegroundColor Yellow
             }
+            elseif (!$foundOutput)
+            {
+                Write-host "$($msixOutPath)_* not found" -ForegroundColor DarkMagenta
+            }
+        }
+        else
+        {
+            Write-host "$($msixPath)_* skipped by request." -ForegroundColor Gray
         }
     }
+    $countPackagesFix = (get-item "$($outputFolder)\*.msix").Count
+    Write-Host "$($Processed) of $($Attempted) packages attempted for fix; total $($countPackagesFix) fixed packages in output folder." -ForegroundColor Green
+
+}
+
+
+Function Find-BestPowerShellExe()
+{
+    $path = "powershell.exe"
+
+    if (Test-Path "$($env:ProgramFiles)\PowerShell\8")
+    {
+        return "$($env:ProgramFiles)\PowerShell\8\powershell.exe"
+    }
+    if (Test-Path "$($env:ProgramFiles)\PowerShell\7")
+    {
+        return "$($env:ProgramFiles)\PowerShell\7\powershell.exe"
+    }
+    return "$($env:WINDIR)\system32\WindowsPowerShell\v1.0\powershell.exe"
+}
+
+Function AutoConvertPackages($AppConversionParameters, $inputFolder, $outputFolder, $ConversionType)
+{
+    $Toolpath = 'TMEditX.exe'
+    $Processed = 0
+    $Attempted = 0
+
+    if (-not (Test-Path -Path $outputFolder))
+    {
+        Write-Host 'Creating AppAttach directory $($outputFolder) .'
+        New-Item -Force -Type Directory ($outputFolder)
+    }
+
+     
+    foreach ($conversionParam in $AppConversionParameters)
+    {
+        $msixPath = [System.IO.Path]::Combine($inputfolder, $conversionParam.PackageName)
+        $appAttachOutPath = [System.IO.Path]::Combine($outputFolder, $conversionParam.PackageName)
+        $appAttachOutFile = 
+        $ConversionCmdLineParameter = "/AutoConvertTo$($ConversionType)"
+        if ( $conversionParam.Enabled )
+        {
+            $Attempted += 1
+            $found = $false
+            $foundOutput = $false
+            Get-ChildItem $inputfolder | foreach-object {
+                if ($_.FullName.StartsWith($msixPath))
+                {
+                    $appAttachOutFile =  [System.IO.Path]::Combine($outputFolder, $_.BaseName)
+                    $appAttachOutFile = "$($appAttachOutFile).$($ConversionType)"
+                    if ($ConversionType.Equals("CIM"))
+                    {
+                        # CIM uses a subfolder of the package name to hold all of the files for the package.
+                        if (-not (Test-Path -Path $appattachOutFile))
+                        {
+                            Write-Host "Creating CIM folder $($appattachOutFile)"
+                            New-Item -Force -Type Directory ($appattachOutFile)
+                        } 
+                        $appattachOutFile = "$($appattachOutFile)\$($_.BaseName).$($ConversionType)"
+                    }
+        
+                    if ($_.Extension.ToLower().EndsWith("msix") -or $_.Extension.ToLower().EndsWith("appx"))
+                    {
+                        $arglist = "$($_.FullName) $($ConversionCmdLineParameter) /AUTOCONVERTSAVEFILEPATH $($appAttachOutFile)" 
+                        Write-Host "Running: $($Toolpath) $($arglist)"  -ForegroundColor Cyan
+                        Start-Process -Wait -FilePath $Toolpath -ArgumentList $arglist
+                        $found = $true
+                        $Processed += 1
+                        Start-Sleep 5
+                    }
+
+                    Get-ChildItem $outputfolder | foreach-object {
+                        if ($_.FullName.StartsWith($appAttachOutFile))
+                        {
+                            $foundOutput = $true
+                        }
+                    }
+                }
+            }
+            if (!$found)
+            {
+                Write-host "$($msixPath)_* not found" -ForegroundColor Yellow
+            }
+            elseif (!$foundOutput)
+            {
+                Write-host "$($appAttachOutFile) not found" -ForegroundColor DarkMagenta
+            }
+        }
+        else
+        {
+            Write-host "$($msixPath)_* skipped by request." -ForegroundColor Gray
+        }
+    }
+    $countPackagesConverted = (get-item "$($outputFolder)\*.$($ConversionType)").Count
+    Write-Host "$($Processed) of $($Attempted) packages attempted for fix; total $($countPackagesConverted) converted packages in output folder." -ForegroundColor Green
+
 }

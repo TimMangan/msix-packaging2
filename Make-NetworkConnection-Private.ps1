@@ -1,0 +1,1 @@
+﻿Get-NetConnectionProfile | Set-NetConnectionProfile -Network Private
